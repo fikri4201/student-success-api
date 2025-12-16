@@ -1,147 +1,110 @@
-# app.py
-# Flask API Sunucusu - Android Uygulaması ile İletişim
+from __future__ import annotations
 
-from flask import Flask, request, jsonify
+import os
+
+from datetime import datetime, timezone
+from math import exp
+from typing import Any, Dict
+
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-import joblib
-import pandas as pd
-import json
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # allow requests from file:// and local networks
 
-print("\n" + "="*70)
-print("🌐 ÖĞRENCİ BAŞARI TAHMİN API SUNUCUSU")
-print("="*70)
 
-try:
-    model = joblib.load('student_success_model.pkl')
-    scaler = joblib.load('scaler.pkl')
-    with open('model_info.json', 'r', encoding='utf-8') as f:
-        model_info = json.load(f)
-    print("✅ Model başarıyla yüklendi!")
-    print(f"   Model: {model_info['model_name']}")
-    print(f"   Versiyon: {model_info['version']}")
-except Exception as e:
-    print(f"❌ Model yüklenemedi: {e}")
-    print("   Lütfen önce 'python train_model.py' komutunu çalıştırın!")
-    model = None
-    scaler = None
-    model_info = None
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
-@app.route('/')
-def home():
-    return jsonify({
-        'status': 'success',
-        'message': 'Öğrenci Başarı Tahmin API Çalışıyor',
-        'version': '1.0',
-        'project': 'TÜBİTAK 2209-A',
-        'author': 'Fikri Özgen'
-    })
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        'status': 'healthy' if model is not None else 'unhealthy',
-        'model_loaded': model is not None,
-        'scaler_loaded': scaler is not None
-    })
+def sigmoid(z: float) -> float:
+    # numerically stable-ish for our ranges
+    if z >= 0:
+        ez = exp(-z)
+        return 1.0 / (1.0 + ez)
+    else:
+        ez = exp(z)
+        return ez / (1.0 + ez)
 
-@app.route('/model_info', methods=['GET'])
-def get_model_info():
-    if model_info is None:
-        return jsonify({'status': 'error', 'message': 'Model bilgisi bulunamadı'}), 500
-    return jsonify({'status': 'success', 'model_info': model_info})
 
-@app.route('/predict', methods=['POST'])
+def predict_score(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Basit ama makul bir tahmin modeli:
+    - Notlar ve devam ağırlıklı
+    - Ödev sayısı ve çalışma saati destekleyici
+    Çıktı: 0-100 skor + başarı olasılığı (0-1)
+    """
+    midterm = float(payload.get("midterm_grade", 0))
+    homework_avg = float(payload.get("homework_avg", 0))
+    previous_gpa = float(payload.get("previous_gpa", 0))
+    attendance = float(payload.get("attendance", 0))
+    homework_count = float(payload.get("homework_count", 0))
+    study_hours = float(payload.get("study_hours", 0))
+
+    # clamp inputs
+    midterm = clamp(midterm, 0, 100)
+    homework_avg = clamp(homework_avg, 0, 100)
+    previous_gpa = clamp(previous_gpa, 0, 100)
+    attendance = clamp(attendance, 0, 100)
+    homework_count = clamp(homework_count, 0, 20)
+    study_hours = clamp(study_hours, 0, 30)
+
+    # weighted score (0-100)
+    # weights sum ~ 1.0 after normalization
+    score = (
+        0.30 * midterm +
+        0.25 * homework_avg +
+        0.25 * previous_gpa +
+        0.15 * attendance +
+        0.03 * (homework_count / 20.0) * 100.0 +
+        0.02 * (study_hours / 30.0) * 100.0
+    )
+    score = clamp(score, 0, 100)
+
+    # probability of passing via logistic around threshold 65
+    # sharper slope around that point
+    probability_pass = sigmoid((score - 65.0) / 7.5)
+
+    if score < 60:
+        risk_level = "Yüksek Risk"
+        msg = "Öğrenci için acil destek/izleme önerilir."
+    elif score < 75:
+        risk_level = "Orta Risk"
+        msg = "Öğrenci takip edilmeli, destek planı faydalı olabilir."
+    else:
+        risk_level = "Düşük Risk"
+        msg = "Öğrenci genel olarak iyi durumda görünüyor."
+
+    return {
+        "score": round(score, 2),
+        "risk_level": risk_level,
+        "probability_pass": round(probability_pass, 4),
+        "message": msg,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.post("/predict")
 def predict():
-    try:
-        if model is None or scaler is None:
-            return jsonify({
-                'status': 'error',
-                'message': 'Model yüklenmemiş. Lütfen train_model.py çalıştırın.'
-            }), 500
-        
-        data = request.get_json()
-        
-        required_fields = ['vize_notu', 'odev_ortalamasi', 'devam_orani', 
-                          'odev_sayisi', 'calisma_saati', 'onceki_donem_ortalamasi']
-        
-        missing_fields = [field for field in required_fields if field not in data]
-        if missing_fields:
-            return jsonify({
-                'status': 'error',
-                'message': f'Eksik alanlar: {", ".join(missing_fields)}'
-            }), 400
-        
-        input_data = pd.DataFrame([data])[model_info['feature_columns']]
-        input_scaled = scaler.transform(input_data)
-        
-        prediction = model.predict(input_scaled)[0]
-        prediction_proba = model.predict_proba(input_scaled)[0]
-        
-        success_score = int(prediction_proba[1] * 100)
-        
-        if success_score >= 70:
-            risk_level = 'low'
-            risk_text = 'Düşük Risk'
-            status = 'success'
-            message = 'Başarılı Olma Olasılığı Yüksek'
-            icon = '✅'
-            recommendation = 'Öğrenci iyi bir performans sergiliyor. Başarılı olacak görünüyor.'
-        elif success_score >= 50:
-            risk_level = 'medium'
-            risk_text = 'Orta Risk'
-            status = 'warning'
-            message = 'Orta Seviye Risk'
-            icon = '⚡'
-            recommendation = 'Öğrenci sınırda. Ek destek ve motivasyon gerekebilir.'
-        else:
-            risk_level = 'high'
-            risk_text = 'Yüksek Risk'
-            status = 'danger'
-            message = 'Başarısız Olma Riski Yüksek'
-            icon = '⚠️'
-            recommendation = 'Öğrenci acil desteğe ihtiyaç duyuyor. Akademik danışmanlık önerilir.'
-        
-        print(f"📊 Tahmin: {success_score}/100 - {risk_text}")
-        
-        return jsonify({
-            'status': 'success',
-            'prediction': {
-                'basarili': bool(prediction),
-                'basari_skoru': success_score,
-                'basarisiz_olasilik': round(prediction_proba[0] * 100, 2),
-                'basarili_olasilik': round(prediction_proba[1] * 100, 2),
-                'risk_seviyesi': risk_level,
-                'risk_text': risk_text,
-                'durum': status,
-                'mesaj': message,
-                'icon': icon,
-                'oneri': recommendation
-            },
-            'input_data': data
-        })
-    
-    except Exception as e:
-        return jsonify({
-            'status': 'error',
-            'message': f'Tahmin yapılırken hata: {str(e)}'
-        }), 500
+    data = request.get_json(silent=True) or {}
+    student_name = (data.get("student_name") or "").strip()
 
-if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("Sunucu Başlatılıyor...")
-    print("="*70)
-    print("\n📡 Erişim Adresleri:")
-    print("   - Yerel: http://localhost:5000")
-    print("   - Ağ: http://0.0.0.0:5000")
-    print("\n📍 Endpoint'ler:")
-    print("   GET  /              : Ana sayfa")
-    print("   GET  /health        : Sağlık kontrolü")
-    print("   GET  /model_info    : Model bilgileri")
-    print("   POST /predict       : Tahmin yap")
-    print("\n⏸️  Durdurmak için: Ctrl+C")
-    print("="*70 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Minimal validation
+    if not student_name:
+        return jsonify({"error": "student_name is required"}), 400
+
+    result = predict_score(data)
+    result["student_name"] = student_name
+    return jsonify(result)
+
+
+if __name__ == "__main__":
+    # Render/Railway/Fly gibi platformlar PORT env değişkeni verir.
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)
